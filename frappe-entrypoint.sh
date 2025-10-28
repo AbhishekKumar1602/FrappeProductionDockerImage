@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 BENCH_DIR="/home/frappe/frappe-bench"
 SITES_DIR="${BENCH_DIR}/sites"
 
@@ -37,6 +36,7 @@ SITES_DIR="${BENCH_DIR}/sites"
 : "${FOLLOWER_WAIT_SECS:=0}"
 : "${LOCK_HEARTBEAT_SECS:=30}"
 : "${LOCK_RENEW_TTL_SECS:=300}"
+: "${STEP_STALE_SECS:=3600}"
 
 ##################################
 #     PATHS, LOCKS & MARKERS     #
@@ -48,6 +48,10 @@ MIGRATION_MARKER="${SITES_DIR}/.migrated_${IMAGE_REV}"
 ASSETS_MARKER="${SITES_DIR}/.assets_built_${IMAGE_REV}"
 APPS_MARKER="${SITES_DIR}/.apps_installed_${IMAGE_REV}"
 INIT_FS_LOCK="${SITES_DIR}/.lock.init_${IMAGE_REV}"
+READY_MARKER="${SITES_DIR}/.ready_${IMAGE_REV}"
+IP_APPS="${SITES_DIR}/.apps_installing_in_progress_${IMAGE_REV}"
+IP_MIGRATE="${SITES_DIR}/.migrate_in_progress_${IMAGE_REV}"
+IP_ASSETS="${SITES_DIR}/.assets_build_in_progress_${IMAGE_REV}"
 
 ########################
 #     REDIS CONFIG     #
@@ -67,17 +71,7 @@ MIGRATE_LOCK_TOKEN=""
 LOCKS_TO_CLEAN=()
 NEW_SITE_CREATED=0
 
-wait_for_marker_forever() {
-  local marker="$1" what="$2" ; local slept=0
-  log "Waiting for ${what} marker: ${marker}."
-  while [[ ! -f "${marker}" ]]; do
-    sleep 2; slept=$((slept+2))
-    if (( slept % 60 == 0 )); then
-      log "Still waiting for ${what} (marker ${marker} not present; ${slept}s elapsed)."
-    fi
-  done
-}
-
+log() { printf '%s %s\n' "$(date -u +'%H:%M:%S')" "$*"; }
 uuid() { (cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || openssl rand -hex 16) | tr -d '\n'; }
 
 redis_cli() {
@@ -102,58 +96,45 @@ register_lock_for_cleanup() {
 cleanup_on_exit() {
   set +e
   log "Entrypoint: running cleanup on exit."
-
   for lock in "${LOCKS_TO_CLEAN[@]:-}"; do
     stop_heartbeat "$lock" || true
   done
-
   if [[ -n "${LEADER_LOCK_TOKEN:-}" ]]; then
     log "Releasing leader lock (${LOCK_LEADER})."
     redis_lock_release "${LOCK_LEADER}" "${LEADER_LOCK_TOKEN}" || true
     LEADER_LOCK_TOKEN=""
   fi
-
   if [[ -n "${MIGRATE_LOCK_TOKEN:-}" ]]; then
     log "Releasing migrate lock (${LOCK_MIGRATE})."
     redis_lock_release "${LOCK_MIGRATE}" "${MIGRATE_LOCK_TOKEN}" || true
     MIGRATE_LOCK_TOKEN=""
   fi
+  rm -f "${IP_APPS}" "${IP_MIGRATE}" "${IP_ASSETS}" || true
 }
+trap cleanup_on_exit EXIT INT TERM
 
 #############################
 #     Pre-Flight Checks     #
 #############################
-log() { printf '%s %s\n' "$(date -u +'%H:%M:%S')" "$*"; }
-
 check_redis() {
   local failed=0
-  local ports_names=(
-    "CACHE:${REDIS_CACHE_PORT}"
-    "QUEUE:${REDIS_QUEUE_PORT}"
-    "SOCKETIO:${REDIS_SOCKETIO_PORT}"
-  )
-
+  local ports_names=( "CACHE:${REDIS_CACHE_PORT}" "QUEUE:${REDIS_QUEUE_PORT}" "SOCKETIO:${REDIS_SOCKETIO_PORT}" )
   for np in "${ports_names[@]}"; do
     local name=${np%%:*}
     local port=${np#*:}
     local result=""
-
     export REDISCLI_AUTH="${REDIS_PASS:-}"
     result="$(redis_cli "${REDIS_HOST}" "${port}" PING 2>/dev/null || true)"
     unset REDISCLI_AUTH
-
     if [ "${result}" != "PONG" ]; then
       result="$(redis_cli "${REDIS_HOST}" "${port}" -a "${REDIS_PASS}" PING 2>/dev/null || true)"
     fi
-
     if [ "${result}" = "PONG" ]; then
       continue
     fi
-
     log "ERROR: Redis ${name} connection/authentication failed (${REDIS_HOST}:${port})."
     failed=1
   done
-
   return $failed
 }
 
@@ -188,19 +169,16 @@ check_db() {
 }
 
 log "Starting preflight checks for Redis and database readiness."
-
 if ! check_redis; then
   rc=$?
   log "One or more Redis checks failed (rc=${rc}). Exiting."
   exit "$rc"
 fi
-
 if ! check_db; then
   rc=$?
   log "Database checks failed (rc=${rc}). Exiting."
   exit "$rc"
 fi
-
 log "Preflight checks for Redis and database done."
 
 ###################################
@@ -214,7 +192,6 @@ start_heartbeat() {
   local ttl="${4:-$LOCK_RENEW_TTL_SECS}"
   local pidfile
   pidfile="${LOCK_HB_DIR}/$(echo -n "$key" | tr ':/' '__').pid"
-
   if [[ -f "$pidfile" ]]; then
     local existing_pid
     existing_pid=$(cat "$pidfile" 2>/dev/null || echo "")
@@ -224,7 +201,6 @@ start_heartbeat() {
       rm -f "$pidfile" || true
     fi
   fi
-
   (
     set -eu
     while true; do
@@ -237,7 +213,6 @@ start_heartbeat() {
       fi
     done
   ) &
-
   echo $! > "$pidfile"
   chmod 644 "$pidfile" || true
 }
@@ -269,7 +244,10 @@ redis_lock_acquire() {
   (( init_ttl < LOCK_RENEW_TTL_SECS )) && init_ttl="$LOCK_RENEW_TTL_SECS"
   (( init_ttl < wait_secs )) && init_ttl="$wait_secs"
   start=$(date +%s)
+  local backoff=0.05
+  local max_backoff=2
   while true; do
+    local resp=""
     if [[ -n "${LOCK_REDIS_PASS:-}" ]]; then
       resp=$(redis_cli "${LOCK_REDIS_HOST}" "${LOCK_REDIS_PORT}" -a "${LOCK_REDIS_PASS}" SET "$key" "$token" NX EX "$init_ttl" 2>/dev/null || true)
     else
@@ -279,8 +257,16 @@ redis_lock_acquire() {
       echo "$token"; return 0
     fi
     now=$(date +%s)
-    (( now - start >= wait_secs )) && { echo ""; return 1; }
-    sleep 0.2
+    if (( now - start >= wait_secs )); then
+      echo ""; return 1
+    fi
+    local jitter
+    jitter=$(awk -v seed="$RANDOM" 'BEGIN{srand(seed); printf "%.3f", rand()*0.2}')
+    sleep "$(awk -v b="$backoff" -v j="$jitter" 'BEGIN{print b + j}')"
+    backoff=$(awk -v b="$backoff" 'BEGIN{print b*1.5}')
+    if (( $(awk -v b="$backoff" -v m="$max_backoff" 'BEGIN{print (b>m)?1:0}') )); then
+      backoff="$max_backoff"
+    fi
   done
 }
 
@@ -304,19 +290,15 @@ redis_lock_renew() {
   fi
 }
 
-trap cleanup_on_exit EXIT INT TERM
-
 ###########################
 #     FILESYSTEM PREP     #
 ###########################
 log "Ensuring permissions on sites/ and logs/."
 mkdir -p "${SITES_DIR}" "${BENCH_DIR}/logs"
 chown -R frappe:frappe "${SITES_DIR}" "${BENCH_DIR}/logs"
-
 mkdir -p /var/log/supervisor /var/run/supervisor
 chown -R root:root /var/log/supervisor /var/run/supervisor
 chmod 755 /var/log/supervisor /var/run/supervisor
-
 mkdir -p /var/log/nginx /var/lib/nginx
 chown -R frappe:frappe /var/log/nginx /var/lib/nginx
 if [[ -f /etc/nginx/nginx.conf ]]; then
@@ -332,7 +314,6 @@ fi
 #     LEADER ELECTION     #
 ###########################
 ROLE="follower"
-
 log "Electing leader....."
 if token=$(redis_lock_acquire "${LOCK_LEADER}" "${LEADER_ELECTION_TIMEOUT}" "${LOCK_RENEW_TTL_SECS}"); then
   ROLE="leader"
@@ -345,9 +326,9 @@ else
   log "This instance is a FOLLOWER."
 fi
 
-###############################
-#     GLOBAL BENCH CONFIG     #
-###############################
+################################
+#     GLOBAL BENCH CONFIG      #
+################################
 gosu frappe bash -lc '
   set -euo pipefail
   cd "'"${BENCH_DIR}"'"
@@ -358,6 +339,33 @@ gosu frappe bash -lc '
   bench set-config -g db_port "'"${DB_PORT}"'"
 '
 
+##########################################
+#     Utilities: In-Progress Markers     #
+##########################################
+write_in_progress() { local marker="$1"; date -u +"%s" > "${marker}"; chown frappe:frappe "${marker}" || true; }
+in_progress_stale() {
+  local marker="$1"
+  if [[ ! -f "$marker" ]]; then return 1; fi
+  local ts
+  ts=$(cat "$marker" 2>/dev/null || echo 0)
+  local now
+  now=$(date -u +"%s")
+  local age=$(( now - ts ))
+  (( age > STEP_STALE_SECS ))
+}
+wait_for_marker_forever() {
+  local marker="$1" what="$2" ; local slept=0 backoff=2
+  log "Waiting for ${what} marker: ${marker}."
+  while [[ ! -f "${marker}" ]]; do
+    sleep "$backoff"
+    slept=$((slept+backoff))
+    (( backoff < 30 )) && backoff=$(( backoff + 2 )) || backoff=30
+    if (( slept % 60 == 0 )); then
+      log "Still waiting for ${what} (marker ${marker} not present; ${slept}s elapsed)."
+    fi
+  done
+}
+
 ###########################
 #     SITE INIT & APPS    #
 ###########################
@@ -365,23 +373,18 @@ if [[ "${ROLE}" == "leader" ]]; then
   if [[ "${SKIP_INIT}" != "1" ]]; then
     if [[ ! -d "${SITE_DIR}" || ! -f "${MIGRATION_MARKER}" ]]; then
       ( set -o noclobber; echo "host=${HOSTNAME} pid=$$ ts=$(date -u +%FT%TZ)" > "${INIT_FS_LOCK}" ) 2>/dev/null || true
-
       cleanup_and_remove_init_lock() {
         cleanup_on_exit || true
         rm -f "${INIT_FS_LOCK}" >/dev/null 2>&1 || true
       }
       trap cleanup_and_remove_init_lock EXIT INT TERM
-
       if [[ ! -d "${SITE_DIR}" ]]; then
         log "Creating site: ${SITE} (DB_TYPE=${DB_TYPE})."
-
         DB_ENGINE_FLAGS=()
         if [[ "${DB_TYPE,,}" == "mariadb" || "${DB_TYPE,,}" == "mysql" ]]; then
           DB_ENGINE_FLAGS+=( --no-mariadb-socket )
         fi
-
         DB_ROOT_PW_FLAG=( --db-root-password "${DB_ROOT_PASS}" )
-
         DB_NAME_FLAG=()
         if [[ -n "${DB_NAME}" ]]; then
           DB_NAME_FLAG+=( --db-name "${DB_NAME}" )
@@ -390,7 +393,6 @@ if [[ "${ROLE}" == "leader" ]]; then
         if [[ -n "${DB_PASS}" ]]; then
           DB_PASS_FLAG+=( --db-password "${DB_PASS}" )
         fi
-
         gosu frappe bash -c '
           set -euo pipefail
           cd "$1"
@@ -408,19 +410,15 @@ if [[ "${ROLE}" == "leader" ]]; then
             "${DB_ROOT_PW_FLAG[@]}" \
             "${DB_NAME_FLAG[@]}" \
             "${DB_PASS_FLAG[@]}"
-
         gosu frappe bash -lc "cd '${BENCH_DIR}'; bench use '${SITE}'"
-
         NEW_SITE_CREATED=1
         date -u +"%FT%TZ" > "${APPS_MARKER}"
         echo "Created by ${HOSTNAME}" >> "${APPS_MARKER}" || true
         chown frappe:frappe "${APPS_MARKER}" || true
         log "Updated apps marker ${APPS_MARKER}."
-
       else
         gosu frappe bash -lc "cd '${BENCH_DIR}'; bench use '${SITE}'"
       fi
-
       if [[ -n "${APPS}" ]]; then
         log "Installing apps: ${APPS}."
         for app in ${APPS}; do
@@ -440,24 +438,28 @@ if [[ "${ROLE}" == "leader" ]]; then
   if [[ -f "${MIGRATION_MARKER}" ]]; then
     log "Migration marker ${MIGRATION_MARKER} exists; skipping migrations for IMAGE_REV=${IMAGE_REV}."
   else
+    if in_progress_stale "${IP_MIGRATE}"; then
+      log "Found stale migrate-in-progress marker; removing and taking over."
+      rm -f "${IP_MIGRATE}" || true
+    fi
     log "Running migrations for IMAGE_REV=${IMAGE_REV}."
     if token=$(redis_lock_acquire "${LOCK_MIGRATE}" "${MIGRATION_LOCK_TIMEOUT}" "${LOCK_RENEW_TTL_SECS}"); then
       MIGRATE_LOCK_TOKEN="$token"
       register_lock_for_cleanup "${LOCK_MIGRATE}"
       start_heartbeat "${LOCK_MIGRATE}" "${MIGRATE_LOCK_TOKEN}" "${LOCK_HEARTBEAT_SECS}" "${LOCK_RENEW_TTL_SECS}"
+      write_in_progress "${IP_MIGRATE}"
       set +e
       gosu frappe bash -lc "cd '${BENCH_DIR}'; bench --site '${SITE}' migrate"
       rc=$?
       set -e
+      rm -f "${IP_MIGRATE}" || true
       stop_heartbeat "${LOCK_MIGRATE}" || true
       redis_lock_release "${LOCK_MIGRATE}" "${MIGRATE_LOCK_TOKEN}" || true
       MIGRATE_LOCK_TOKEN=""
-
       if [[ $rc -ne 0 ]]; then
         log "bench migrate failed with code ${rc}."
         exit $rc
       fi
-
       echo "$(date -u +"%FT%TZ") by ${HOSTNAME}" > "${MIGRATION_MARKER}"
       chown frappe:frappe "${MIGRATION_MARKER}" || true
       log "Migration completed; wrote marker ${MIGRATION_MARKER}."
@@ -481,7 +483,12 @@ if [[ "${ROLE}" == "leader" && -n "${APPS}" && "${NEW_SITE_CREATED:-0}" -eq 0 ]]
   if [[ -f "${APPS_MARKER}" ]]; then
     log "Apps marker ${APPS_MARKER} exists; skipping app installations for IMAGE_REV=${IMAGE_REV}."
   else
+    if in_progress_stale "${IP_APPS}"; then
+      log "Found stale apps-in-progress marker; removing and taking over."
+      rm -f "${IP_APPS}" || true
+    fi
     log "Ensuring all apps from .env: ${APPS} are installed."
+    write_in_progress "${IP_APPS}"
     installed_apps=$(gosu frappe bash -lc "cd '${BENCH_DIR}'; bench --site '${SITE}' list-apps --format json" | jq -r '.[]? // empty')
     did_install_any=0
     for app in ${APPS}; do
@@ -491,13 +498,13 @@ if [[ "${ROLE}" == "leader" && -n "${APPS}" && "${NEW_SITE_CREATED:-0}" -eq 0 ]]
         did_install_any=1
       fi
     done
-
     if [[ "${did_install_any}" == "1" ]]; then
       log "Running migration after new app installation."
       gosu frappe bash -lc "cd '${BENCH_DIR}'; bench --site '${SITE}' migrate"
       echo "$(date -u +"%FT%TZ") by ${HOSTNAME}" > "${MIGRATION_MARKER}"
       chown frappe:frappe "${MIGRATION_MARKER}"
     fi
+    rm -f "${IP_APPS}" || true
     echo "$(date -u +"%FT%TZ") by ${HOSTNAME}" > "${APPS_MARKER}"
     chown frappe:frappe "${APPS_MARKER}" || true
     log "Missing apps installed; wrote marker ${APPS_MARKER}."
@@ -520,9 +527,15 @@ if [[ "${ROLE}" == "leader" ]]; then
   if [[ -f "${ASSETS_MARKER}" ]]; then
     log "Assets marker ${ASSETS_MARKER} exists; skipping assets build for IMAGE_REV=${IMAGE_REV}."
   else
+    if in_progress_stale "${IP_ASSETS}"; then
+      log "Found stale assets-in-progress marker; removing and taking over."
+      rm -f "${IP_ASSETS}" || true
+    fi
     log "Rebuilding assets for IMAGE_REV=${IMAGE_REV}."
+    write_in_progress "${IP_ASSETS}"
     rm -rf "${SITES_DIR}/assets/.webassets-cache" 2>/dev/null || true
     gosu frappe bash -lc "set -e; cd '${BENCH_DIR}'; bench build --production"
+    rm -f "${IP_ASSETS}" || true
     echo "$(date -u +"%FT%TZ") by ${HOSTNAME}" > "${ASSETS_MARKER}"
     chown frappe:frappe "${ASSETS_MARKER}" || true
     log "Assets rebuilt; wrote marker ${ASSETS_MARKER}."
@@ -533,6 +546,17 @@ else
       sleep "${FOLLOWER_WAIT_SECS}"
     fi
     wait_for_marker_forever "${ASSETS_MARKER}" "assets"
+  fi
+fi
+
+###################################
+#     Create Readiness Marker     #
+###################################
+if [[ -f "${MIGRATION_MARKER}" && -f "${ASSETS_MARKER}" && -f "${APPS_MARKER}" ]]; then
+  if [[ ! -f "${READY_MARKER}" ]]; then
+    log "Creating readiness marker ${READY_MARKER}."
+    touch "${READY_MARKER}"
+    chown frappe:frappe "${READY_MARKER}" || true
   fi
 fi
 

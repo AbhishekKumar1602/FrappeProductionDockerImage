@@ -1,0 +1,22 @@
+services:
+  frappe:
+    image: frappe-prod-image:latest
+    container_name: frappe
+    env_file:
+      - ./.env
+    environment:
+      IMAGE_REV: "v1"
+      FOLLOWER_WAIT_SECS: "2"
+      LOCK_HEARTBEAT_SECS: "30"
+      LOCK_RENEW_TTL_SECS: "300"
+      STEP_STALE_SECS: "3600"
+    volumes:
+      - frappe-sites:/home/frappe/frappe-bench/sites
+      - frappe-logs:/home/frappe/frappe-bench/logs
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  frappe-sites:
+  frappe-logs:

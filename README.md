@@ -1,106 +1,77 @@
 # FRAPPE Production Docker Image
+This repository provides a production-focused Docker image and orchestration examples to run Frappe/ERPNext using **multiple identical containers** against the **same persistent `sites` volume**. Containers coordinate via Redis: one container becomes the leader and performs one-off tasks (site creation, app installs, migrations, asset builds). Followers wait until the leader finishes.
 
-A production-focused Docker image for running Frappe in containers that share the same persistent volumes. This image bundles Node, wkhtmltopdf, Nginx, Gunicorn, Socket.IO, background workers, scheduler, and a Redis-backed leader-election boot flow so **multiple identical containers** can run against the **same** site data safely.
 
-The leader container performs one-time / coordinated tasks (site init, migrations, building assets). Followers wait for the leader to finish and then start serving.
+**Security note:** For private app repos, avoid embedding PATs in the image. Use runtime secrets, build-time secure pipelines, or private build contexts.
 
-## Highlights
+## Build the image (recommended)
+If you want to include `apps.json` at build-time (so `bench init` happens in the builder), you can embed it via build-arg:
 
-* Designed to run **multiple identical containers** against the **same persistent volumes**.
-* Uses **Redis** for leader election and coordination.
-* Leader handles site setup, migrations, and asset builds; followers start after markers appear.
-* Includes common production components: Nginx, Gunicorn, Socket.IO, workers, scheduler, Node.js, wkhtmltopdf.
+```bash
+docker buildx build \
+  --no-cache-filter=builder \
+  --build-arg APPS_JSON_BASE64="$(base64 -w0 apps.json)" \
+  -t frappe-prod-image:latest .
+```
 
-## Quick Start (TL;DR)
+**Important:** Do not embed private tokens into the image unless you are building in a secure environment and rotate tokens.
 
-1. Copy the example environment and apps file and update them:
+## Run with Docker Compose 
+
+1. Copy example .env and app.json and update accordingly:
 
 ```bash
 cp .env.example .env
 cp apps.json.example apps.json
 ```
 
-2. Build the image (embed `apps.json` into the build):
-
-```bash
-docker buildx build \
-  --no-cache-filter=builder \
-  --build-arg APPS_JSON_BASE64="$(base64 -w0 apps.json)" \
-  -t frappe-prod-image .
-```
-
-3. Create persistent volumes for sites and logs:
-
+2. Ensure Volumes Exist:
 ```bash
 docker volume create frappe-sites
 docker volume create frappe-logs
 ```
 
-4. Start the first instance (this will become the **leader**):
+3. Start Services:
+```bash
+docker compose up -d
+```
+
+4. Check Logs:
+```bash
+docker compose logs -f --tail=100
+```
+
+> One container should become **LEADER** and perform site creation / app installs / migrations / assets builds. Followers wait for the markers and then start serving.
+
+## Readiness & Healthchecks
+* The entrypoint creates a readiness marker at:
+```bash
+/home/frappe/frappe-bench/sites/.ready_<IMAGE_REV>
+```
+when `apps`, `migrations`, and `assets` for `IMAGE_REV` are completed.
+* Use this file for readiness probes in orchestrators (Kubernetes readiness `exec: test -f ...`).
+* Container `HEALTHCHECK` in image points to `/api/method/ping`, but orchestration readiness should rely on the `.ready_...` marker to avoid routing traffic to a container that is still waiting.
+
+## Handling Partial Failures and Stale Steps
+* If leader crashes mid-step, it leaves an `.in_progress` marker (e.g. `.apps_installing_in_progress_v1`).
+* A subsequent leader checks the marker timestamp — if it's older than `STEP_STALE_SECS`, it will remove it and take over.
+* Tune `STEP_STALE_SECS` based on expected installation time.
+
+## Volumes & Permissions
+* If using host bind mounts, ensure ownership permits the `frappe` user (UID typically `1000`) to write:
 
 ```bash
-docker rm -f frappe-a 2>/dev/null || true
-docker run -d --name frappe-a \
-  --env-file ./.env \
-  -p 8081:80 \
-  -v frappe-sites:/home/frappe/frappe-bench/sites \
-  -v frappe-logs:/home/frappe/frappe-bench/logs \
-  frappe-prod-image
-
-docker logs -f frappe-a
+docker run --rm -v frappe-sites:/mnt/tmp busybox chown -R 1000:1000 /mnt/tmp
 ```
+* In k8s, use RWX-capable storage (NFS, CephFS) if running >1 replica.
 
-5. Start additional instances (followers) **pointing to the same volumes**:
-
-```bash
-docker rm -f frappe-b 2>/dev/null || true
-docker run -d --name frappe-b \
-  --env-file ./.env \
-  -p 8082:80 \
-  -v frappe-sites:/home/frappe/frappe-bench/sites \
-  -v frappe-logs:/home/frappe/frappe-bench/logs \
-  frappe-prod-image
-
-docker logs -f frappe-b
-```
-
-## How it works
-* **Leader election**: Containers coordinate with Redis. On startup they attempt to acquire leadership.
-* **Leader responsibilities**: site creation/initialization, running database migrations, building frontend assets, and writing markers that indicate those steps completed.
-* **Followers**: wait for the leader to finish (presence of marker files / flags in the shared volumes or Redis), then start the web server and workers.
-* **Idempotency**: operations are safe to re-run; leader logic guards against race conditions so multiple simultaneous containers won’t corrupt the shared data.
-
-## Environment & Configuration
-* `.env` contains runtime configuration (Redis URL, database connection, admin credentials for site creation, etc.). Fill this file before running containers.
-* `apps.json` (embedded at build time) lists Frappe/ERPNext apps to include.
-* Important: ensure the same `.env` and `apps.json` are used for all containers that share volumes.
-
-## Volumes and Persistence
-* Use Docker volumes (or bind mounts) for:
-  * `sites` — store site data, uploaded files, and site configs.
-  * `logs` — store application logs.
-
-Example mount points used in the Quick Start:
-
-```
--v frappe-sites:/home/frappe/frappe-bench/sites
--v frappe-logs:/home/frappe/frappe-bench/logs
-```
-
-## Ports
-* The container exposes port `80`. Map it to the host as needed (e.g., `-p 8081:80`).
-* If running multiple containers on one host for testing, map each to a different host port.
+## Redis & Reliability
+Leader election **depends** on Redis. For production:
+* Run Redis in a highly available mode (Sentinel or Cluster) or managed Redis (ElastiCache, Redis Enterprise).
+* A single, flaky Redis instance can cause split-brain or election instability.
 
 ## Troubleshooting
-* **No leader elected / Redis errors**: confirm Redis is reachable from containers and the URL in `.env` is correct.
-* **Site init or migrations hang**: check leader logs (`docker logs -f <leader>`) for errors and ensure file permissions on volumes permit the container to write markers.
-* **Follower never starts serving**: verify that the leadership marker files exist in the shared volume and that follower can read them.
-
-## Best Practices
-* Run Redis as a highly-available service (or ensure it's reliably reachable) — leader election depends on it.
-* Use a single, consistent `.env` and `apps.json` for all containers attached to the same volumes.
-* Back up the `frappe-sites` volume regularly (it contains user data and sites).
-* For production, run containers behind a load balancer and do health checks against the web process.
-
-## Example: Compose / Orchestration
-You can run instances with Docker Compose, Kubernetes, or any orchestration layer — just mount the same persistent storage and supply identical env/config. Make sure Redis is shared and reachable by all replicas.
+* **No leader / Redis errors**: Check connectivity to Redis and credentials; logs show PING failures.
+* **Follower never proceeds**: Inspect presence/ownership of `.migrated_*`, `.apps_installed_*`, `.assets_built_*` markers in the `sites` volume. Ensure follower can read them.
+* **Stuck due to stale marker**: Increase `STEP_STALE_SECS` or manually remove the offending `.in_progress` file if you understand the state.
+* **Permission denied writing markers**: Adjust volume ownership (`chown`) or correct mount options.
