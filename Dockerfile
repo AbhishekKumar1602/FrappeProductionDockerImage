@@ -78,7 +78,7 @@ RUN set -euo pipefail; \
 
 ARG APPS_JSON_BASE64
 RUN if [ -n "${APPS_JSON_BASE64:-}" ]; then \
-      mkdir -p /opt/frappe && echo "${APPS_JSON_BASE64}" | base64 -d > /opt/frappe/apps.json; \
+      mkdir -p /opt/frappe && echo "${APPS_JSON_BASE64}" | base64 -d > /opt/frappe/apps.json && chown -R frappe:frappe /opt/frappe; \
     fi
 
 USER frappe
@@ -121,7 +121,7 @@ COPY supervisord.conf /etc/supervisor/conf.d/frappe.conf
 COPY frappe-entrypoint.sh /usr/local/bin/frappe-entrypoint.sh
 RUN chmod +x /usr/local/bin/frappe-entrypoint.sh
 
-VOLUME [ "/home/frappe/frappe-bench/sites", "/home/frappe/frappe-bench/sites/assets", "/home/frappe/frappe-bench/logs" ]
+VOLUME [ "/home/frappe/frappe-bench/sites", "/home/frappe/frappe-bench/logs" ]
 
 ENV BACKEND=127.0.0.1:8000 \
     SOCKETIO=127.0.0.1:9000 \

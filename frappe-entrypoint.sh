@@ -411,6 +411,7 @@ if [[ "${ROLE}" == "leader" ]]; then
             "${DB_NAME_FLAG[@]}" \
             "${DB_PASS_FLAG[@]}"
         gosu frappe bash -lc "cd '${BENCH_DIR}'; bench use '${SITE}'"
+        gosu frappe bash -lc "cd '${BENCH_DIR}'; bench build --production --verbose;"
         NEW_SITE_CREATED=1
         date -u +"%FT%TZ" > "${APPS_MARKER}"
         echo "Created by ${HOSTNAME}" >> "${APPS_MARKER}" || true
