@@ -1,0 +1,6 @@
+[
+  {"url":"https://github.com/frappe/erpnext.git","branch":"version-15"},
+  {"url":"https://github.com/frappe/payments.git","branch":"version-15"},
+  {"url":"https://<userName>:<PAT>@<customAppA-repo-url>", "branch": "<branch-name>"},
+  {"url":"https://<userName>:<PAT>@<customAppB-repo-url>", "branch": "<branch-name>"}
+]

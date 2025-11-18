@@ -1,0 +1,71 @@
+services:
+  init:
+    image: frappe-init:latest
+    env_file: .env
+    volumes:
+      - frappe-bench:/home/frappe/frappe-bench
+    networks:
+      - frappe-net
+    restart: "no"
+
+  web:
+    image: frappe-runtime:latest
+    env_file: .env
+    environment:
+      ENABLE_WEB: "1"
+      ENABLE_WORKERS: "0"
+      ENABLE_SCHEDULER: "0"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - frappe-bench:/home/frappe/frappe-bench
+    ports:
+      - "8080:80"
+    networks:
+      - frappe-net
+    restart: unless-stopped
+
+  worker:
+    image: frappe-runtime:latest
+    env_file: .env
+    environment:
+      ENABLE_WEB: "0"
+      ENABLE_WORKERS: "1"
+      ENABLE_SCHEDULER: "0"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - frappe-bench:/home/frappe/frappe-bench
+    networks:
+      - frappe-net
+    restart: unless-stopped
+
+  scheduler:
+    image: frappe-runtime:latest
+    env_file: .env
+    environment:
+      ENABLE_WEB: "0"
+      ENABLE_WORKERS: "0"
+      ENABLE_SCHEDULER: "1"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - frappe-bench:/home/frappe/frappe-bench
+    networks:
+      - frappe-net
+    restart: unless-stopped
+
+volumes:
+  frappe-bench:
+    driver: local
+    driver_opts:
+      type: "nfs"
+      o: "addr=192.168.20.106,nfsvers=4,rw,soft,timeo=600,retrans=2"
+      device: ":/srv/nfs/test/frappe-bench"
+
+networks:
+  frappe-net:
+    driver: bridge

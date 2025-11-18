@@ -1,0 +1,10 @@
+Dockerfile-InitContainer
+Dockerfile-RuntimeContainer
+docker-compose.yml
+apps.json
+apps.json.example
+example.env
+.env
+.git
+.gitignore
+README.md
